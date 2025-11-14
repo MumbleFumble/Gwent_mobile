@@ -30,6 +30,9 @@ class Player:
 		self.hand.remove(card)
 		return card
 
+	def add_to_hand(self, card: Card) -> None:
+		self.hand.append(card)
+
 	def find_in_hand(self, name: str) -> Optional[Card]:
 		for c in self.hand:
 			if c.name == name:

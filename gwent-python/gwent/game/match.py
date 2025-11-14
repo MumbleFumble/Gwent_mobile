@@ -44,6 +44,8 @@ class Match:
 				self.wins[winner.id] += 1
 			if any(w >= 2 for w in self.wins.values()) or self.round_number >= 3:
 				return
+			# Cleanup board (move units to graveyards, reset row state) before next round
+			self.board.cleanup_after_round()
 			self.start_round()
 
 	def match_winner(self) -> Optional[Player]:

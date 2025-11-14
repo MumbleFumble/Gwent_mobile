@@ -23,9 +23,17 @@ class Round:
 	def next_player(self) -> None:
 		self.turn_index = (self.turn_index + 1) % len(self.players)
 
-	def play_card(self, player: Player, card: Card) -> None:
+
+	def play_card(self, player: Player, card: Card, target_row=None, target_unit: Optional[Card] = None) -> None:
 		placed = player.play_from_hand(card)
-		self.board.play_card(player.id, placed)
+		events = self.board.play_card(player.id, placed, target_row=target_row, target_unit=target_unit)
+		# Spy: playing player draws 2
+		if events.get("spy_played") is not None:
+			player.draw(2)
+		# Decoy: return selected unit to player's hand
+		returned = events.get("decoy_returned")
+		if returned is not None:
+			player.add_to_hand(returned)
 		self._check_auto_end()
 		self.next_player()
 

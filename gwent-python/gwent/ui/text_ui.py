@@ -8,6 +8,7 @@ from gwent.cards.base_card import Card, CardType, Ability, Row
 from gwent.game.player import Player
 from gwent.game.match import Match
 from gwent.game.effects import activate_leader
+from gwent.ai.hybrid_ai import HybridAI, Action as AIAction
 
 # Numeric row shortcuts for quicker play input
 ROW_INDEX_MAP = {
@@ -26,14 +27,17 @@ class TextUI:
       pass                Pass the turn
       board               Show board rows and strengths
       graveyard           Show your graveyard
+    info <index|name>   Show detailed info for a card in hand or by name
       leader              Activate leader ability (once)
       help                Show commands
       quit                Exit immediately
     """
 
-    def __init__(self, match: Match, leaders: Dict[str, Card]):
+    def __init__(self, match: Match, leaders: Dict[str, Card], ai_player_id: Optional[str] = None):
         self.match = match
         self.leaders = leaders  # player_id -> leader card
+        self.ai_player_id = ai_player_id
+        self.ai: Optional[HybridAI] = HybridAI(ai_player_id) if ai_player_id else None
 
     def _render_hand(self, player: Player) -> None:
         print(f"\n{player.id} Hand:")
@@ -109,6 +113,56 @@ class TextUI:
         else:
             print("Leader ability had no effect.")
 
+    def _show_card_info(self, player: Player, token: str) -> None:
+        """Show detailed information about a card.
+
+        token can be a hand index or a (partial) name.
+        """
+        card: Optional[Card] = None
+        # Try index into hand first
+        try:
+            idx = int(token)
+            if 0 <= idx < len(player.hand):
+                card = player.hand[idx]
+        except ValueError:
+            pass
+
+        # Fallback: search by name substring across hand and leader
+        if card is None:
+            name_l = token.lower()
+            all_candidates: List[Card] = list(player.hand)
+            leader = self.leaders.get(player.id)
+            if leader is not None:
+                all_candidates.append(leader)
+            matches = [c for c in all_candidates if name_l in c.name.lower()]
+            if len(matches) == 1:
+                card = matches[0]
+            elif len(matches) > 1:
+                print("Multiple matches:")
+                for i, c in enumerate(matches):
+                    print(f"  ({i}) {c.name}")
+                return
+
+        if card is None:
+            print("Card not found in your hand or leader.")
+            return
+
+        # Build info output
+        print("\n--- Card Info ---")
+        print(f"Name: {card.name}")
+        print(f"Type: {card.type.value}")
+        print(f"Faction: {card.faction.value}")
+        print(f"Row: {card.row.value}")
+        print(f"Power: {card.power}")
+        print(f"Hero: {'yes' if card.is_hero else 'no'}")
+        if card.abilities:
+            print("Abilities:", ", ".join(a.value for a in card.abilities))
+        quote = card.meta.get("quote") if isinstance(card.meta, dict) else None
+        if quote:
+            print(f"Quote: {quote}")
+        if getattr(card, "leader_ability", None):
+            print(f"Ability text: {card.leader_ability}")
+
     def run(self) -> None:
         print("\n=== Starting Gwent Match ===")
         self.match.start_round()
@@ -127,6 +181,23 @@ class TextUI:
             # Always show current board + hand before input
             self._render_status(player)
             print(f"\nTurn: {player.id} (Total {self.match.board.total_strength(player.id)})")
+
+            # If this player is AI-controlled, let AI choose and execute action automatically
+            if self.ai and player.id == self.ai_player_id:
+                action: AIAction = self.ai.choose_action(self.match)
+                if action.kind == "pass":
+                    self.match.pass_turn(player)
+                    print(f"{player.id} (AI) passes.")
+                elif action.kind == "play" and action.card is not None:
+                    try:
+                        self.match.play_card(player, action.card, target_row=action.target_row, target_unit=action.target_unit)
+                        print(f"{player.id} (AI) plays {action.card.name}.")
+                    except (ValueError, RuntimeError) as e:
+                        print(f"AI play error: {e}")
+                        self.match.pass_turn(player)
+                        print(f"{player.id} (AI) passes due to error.")
+                continue
+
             cmd = input("Command (help): ").strip().lower()
             if not cmd:
                 continue
@@ -134,7 +205,7 @@ class TextUI:
                 print("Exiting match.")
                 break
             if cmd == "help":
-                print("Commands: hand, play <index> [row], pass, board, graveyard, leader, quit")
+                print("Commands: hand, play <index> [row], pass, board, graveyard, info <index|name>, leader, quit")
                 continue
             if cmd == "hand":
                 self._render_hand(player)
@@ -197,6 +268,13 @@ class TextUI:
             if cmd == "graveyard":
                 self._render_graveyard(player)
                 continue
+            if cmd.startswith("info"):
+                parts = cmd.split(maxsplit=1)
+                if len(parts) == 1:
+                    print("Usage: info <hand_index|card_name_substring>")
+                    continue
+                self._show_card_info(player, parts[1])
+                continue
             if cmd == "leader":
                 self._activate_leader(player)
                 continue
@@ -231,9 +309,18 @@ def build_demo_players(card_pool: List[Card]) -> Match:
 
 def start_text_ui() -> None:
     cards = load_cards()
+    # Choose mode: PvP or vs AI
+    print("\n=== Gwent Main Menu ===")
+    print("  [0] Player vs Player")
+    print("  [1] Player vs AI (P2 is AI)")
+    mode_raw = input("Choose mode [0/1]: ").strip()
+    ai_player_id: Optional[str] = None
+    if mode_raw == "1":
+        ai_player_id = "P2"
+
     # Offer setup menu to pick factions/leaders/decks
     match, leader_map = setup_match_via_menu(cards)
-    ui = TextUI(match, leader_map)
+    ui = TextUI(match, leader_map, ai_player_id=ai_player_id)
     ui.run()
 
 
@@ -258,6 +345,31 @@ def setup_match_via_menu(card_pool: List[Card]):
     # Available factions come from leaders to ensure a leader exists
     factions = sorted({c.faction for c in all_leaders})
 
+    def _leader_short_desc(card: Card) -> str:
+        """Return a compact description derived from leader ability text."""
+        ability_text = getattr(card, "leader_ability", "") or ""
+        t = ability_text.lower()
+        if not t:
+            return "no ability text"
+        if "clear" in t and "weather" in t:
+            return "clear all weather"
+        if "biting frost" in t:
+            return "set melee to 1 (frost)"
+        if "impenetrable fog" in t:
+            return "set ranged to 1 (fog)"
+        if "torrential rain" in t:
+            return "set siege to 1 (rain)"
+        if "skellige storm" in t:
+            return "set all rows to 1 (storm)"
+        if ("double" in t or "commander" in t) and "melee" in t:
+            return "double melee row"
+        if ("double" in t or "commander" in t) and ("ranged" in t or "range" in t):
+            return "double ranged row"
+        if ("double" in t or "commander" in t) and "siege" in t:
+            return "double siege row"
+        # Fallback: trim raw ability text
+        return ability_text.strip()
+
     def prompt_choice(title: str, options: List[str]) -> int:
         while True:
             print(f"\n{title}")
@@ -275,7 +387,8 @@ def setup_match_via_menu(card_pool: List[Card]):
     def select_leader_any(pid: str) -> Card:
         if not all_leaders:
             raise RuntimeError("No leaders available.")
-        idx = prompt_choice(f"{pid} Leader", [f"{c.name} ({c.faction.value})" for c in all_leaders])
+        opts = [f"{c.name} [{_leader_short_desc(c)}]" for c in all_leaders]
+        idx = prompt_choice(f"{pid} Leader", opts)
         return all_leaders[idx]
 
     def manual_pick_deck(pid: str, count: int = 30) -> List[Card]:
@@ -410,7 +523,8 @@ def setup_match_via_menu(card_pool: List[Card]):
         f_idx = prompt_choice("Faction", [f.value for f in factions])
         faction = factions[f_idx]
         leaders = [c for c in all_leaders if c.faction == faction] or all_leaders[:]
-        l_idx = prompt_choice("Leader", [c.name for c in leaders])
+        leader_opts = [f"{c.name} [{_leader_short_desc(c)}]" for c in leaders]
+        l_idx = prompt_choice("Leader", leader_opts)
         leader = leaders[l_idx]
 
         def prompt_int(msg: str, default: int) -> int:

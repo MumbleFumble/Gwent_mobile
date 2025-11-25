@@ -9,28 +9,14 @@ Later, this should:
 
 from typing import NoReturn
 
+from gwent.ui.text_ui import start_text_ui
+
 
 def main() -> NoReturn:
     print("=== Gwent (Witcher 3 Minigame) ===")
-    print("Backend/engine not fully implemented yet.")
-    print("Planned flow:")
-    print("  1. Initialize decks for Player and AI")
-    print("  2. Play best-of-three rounds")
-    print("  3. Show final winner")
-
-    # TODO:
-    # from gwent.game.match import Match
-    # from gwent.ui.text_ui import TextUI
-    #
-    # match = Match.new_default()
-    # ui = TextUI(match)
-    # ui.run()
-
-    while True:
-        choice = input("\nType 'q' to quit: ").strip().lower()
-        if choice == "q":
-            print("Goodbye, Gwent player.")
-            break
+    print("Launching demo Text UI. Type 'help' for commands.")
+    start_text_ui()
+    print("Goodbye, Gwent player.")
 
 
 if __name__ == "__main__":

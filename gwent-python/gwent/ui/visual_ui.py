@@ -1,20 +1,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 import random
 
 import pygame
 
 from gwent.cards import load_cards
-from gwent.cards.base_card import Card, Row
+from gwent.cards.base_card import Card, CardType, Row
 from gwent.game.match import Match
-from gwent.ui.text_ui import setup_match_via_menu
+from gwent.game.player import Player
 from gwent.ai.hybrid_ai import HybridAI
 
 
 WINDOW_SIZE = (1600, 900)
 FPS = 60
+
+
+# ---------------------------------
+# Palette & subtle style constants
+# ---------------------------------
+WOOD_DARK = (24, 17, 10)
+WOOD_MID = (46, 32, 20)
+WOOD_LIGHT = (73, 51, 32)
+
+BRONZE_DARK = (80, 55, 30)
+BRONZE_MID = (134, 96, 52)
+BRONZE_LIGHT = (196, 160, 96)
+
+PARCHMENT_LIGHT = (214, 199, 167)
+PARCHMENT_MID = (191, 173, 138)
+
+GLOW_GOLD = (255, 222, 140)
+TURN_GLOW = (220, 200, 120)
 
 
 @dataclass
@@ -52,17 +70,53 @@ class VisualUI:
         self.row_choice_buttons: List[Tuple[Row, pygame.Rect]] = []
         self.ai_wait_timer: float = 0.0
 
+        # Mulligan state (redraw up to 2 cards before first round)
+        self.phase: str = "mulligan"  # "mulligan" or "play"
+        self.mulligan_discards: int = 0
+        self.mulligan_max_discards: int = 2
+        self.mulligan_confirm_rect: Optional[pygame.Rect] = None
+        # For hit-testing discard icons during mulligan: map card id to rect
+        self.mulligan_discard_buttons: List[Tuple[Card, pygame.Rect]] = []
+        self.hovered_hand_index: Optional[int] = None
+
+        # Drag-and-drop state for cards in hand
+        self.dragging_card: Optional[Card] = None
+        self.drag_offset: Tuple[int, int] = (0, 0)
+        self.drag_rect: Optional[pygame.Rect] = None
+
+        # Cached lane rects for hit-testing drops: (player_id, row) -> Rect
+        self.row_lane_rects: Dict[Tuple[str, Row], pygame.Rect] = {}
+
     # -----------------------
     # Drawing helpers
     # -----------------------
     def draw(self) -> None:
-        self.screen.fill((40, 28, 18))  # tavern background
+        # Layered wood background with subtle vignette
+        full_rect = self.screen.get_rect()
+        for i in range(full_rect.height):
+            t = i / max(1, full_rect.height - 1)
+            r = int(WOOD_MID[0] + (WOOD_LIGHT[0] - WOOD_MID[0]) * t)
+            g = int(WOOD_MID[1] + (WOOD_LIGHT[1] - WOOD_MID[1]) * t)
+            b = int(WOOD_MID[2] + (WOOD_LIGHT[2] - WOOD_MID[2]) * t)
+            pygame.draw.line(self.screen, (r, g, b), (0, i), (full_rect.width, i))
+
+        # Simple vignette: darken edges slightly
+        vignette = pygame.Surface(full_rect.size, pygame.SRCALPHA)  # type: ignore[attr-defined]
+        for i in range(10):
+            alpha = int(10 + i * 5)
+            pygame.draw.rect(
+                vignette,
+                (0, 0, 0, alpha),
+                full_rect.inflate(-i * 24, -i * 24),
+                width=4,
+            )
+        self.screen.blit(vignette, (0, 0))
         board = self.match.board
         round_obj = self.match.current_round
         active_id = round_obj.active_player.id if round_obj else "?"
 
-        # Main board area inset
-        margin_x = 40
+        # Main tavern table inset (center, leaving side panels)
+        margin_x = 260  # leave room on left for portraits / scores
         margin_y = 40
         board_rect = pygame.Rect(
             margin_x,
@@ -71,14 +125,18 @@ class VisualUI:
             self.screen.get_height() - margin_y - 180,
         )
 
-        # Outer board
-        pygame.draw.rect(self.screen, (70, 50, 30), board_rect)
-        pygame.draw.rect(self.screen, (140, 110, 60), board_rect, 3)
+        # Outer board slab with bronze frame and recessed interior
+        pygame.draw.rect(self.screen, WOOD_MID, board_rect)
+        pygame.draw.rect(self.screen, BRONZE_DARK, board_rect, 6)
+        pygame.draw.rect(self.screen, BRONZE_MID, board_rect.inflate(-6, -6), 4)
+        inner = board_rect.inflate(-18, -18)
+        pygame.draw.rect(self.screen, WOOD_DARK, inner)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, inner, 1)
 
-        # Divide board into 7 horizontal bands (3 opp rows, weather, 3 player rows)
-        row_h = board_rect.height // 7
+        # Divide board into 7 horizontal bands (3 opp rows, thin weather, 3 player rows)
+        row_h = int(board_rect.height // 7 * 0.95)
 
-        # Weather/effects strip in the middle
+        # Weather/effects strip in the middle (very slim)
         self._draw_weather_strip(board_rect, row_h)
 
         # Opponent rows (top): siege, ranged, melee
@@ -88,14 +146,20 @@ class VisualUI:
         # Player rows (bottom): melee, ranged, siege
         self._draw_combat_rows("P1", board_rect, row_h, top=False)
 
-        # Leaders and scores
+        # Left and right side panels (portraits / extra slots)
+        self._draw_side_panels(board_rect)
+
+        # Leaders and scores overlaid near left portraits
         self._draw_leaders_and_scores(board_rect)
 
-        # Status / round info
-        self._draw_status_bar(active_id)
+        # PASS button anchored to bottom-right of board
+        self._draw_status_bar(active_id, board_rect)
 
-        # Player hand area (with potential for scrolling later)
-        self._draw_hand("P1")
+        # Player hand / mulligan (now sits directly under board)
+        if self.phase == "mulligan":
+            self._draw_mulligan_hand("P1")
+        else:
+            self._draw_hand("P1")
 
         # Optional card info overlay
         if self.info_card is not None:
@@ -108,197 +172,611 @@ class VisualUI:
         pygame.display.flip()
 
     def _draw_weather_strip(self, board_rect: pygame.Rect, row_h: int) -> None:
-        # Central weather/effects band
-        y = board_rect.y + 3 * row_h + 4
-        h = row_h - 8
-        rect = pygame.Rect(board_rect.x + 20, y, board_rect.width - 40, h)
-        pygame.draw.rect(self.screen, (35, 45, 70), rect)
-        pygame.draw.rect(self.screen, (140, 110, 60), rect, 2)
+        # Dark, foggy banner strip between rows
+        y = board_rect.y + 3 * row_h + row_h // 2 - row_h // 4
+        h = row_h // 2
+        rect = pygame.Rect(board_rect.x + 32, y, board_rect.width - 64, h)
 
-        # Show active weather summary
+        banner = pygame.Surface(rect.size, pygame.SRCALPHA)  # type: ignore[attr-defined]
+        for i in range(rect.height):
+            t = i / max(1, rect.height - 1)
+            col = (18 + int(30 * t), 20 + int(35 * t), 30 + int(40 * t))
+            pygame.draw.line(banner, col, (0, i), (rect.width, i))
+
+        # Swirling mist / rain lines
+        for i in range(6):
+            line_y = int((i + 1) * rect.height / 8)
+            color = (140, 150, 170, 38)
+            pygame.draw.line(banner, color, (10, line_y), (rect.width - 10, line_y))
+
+        pygame.draw.rect(banner, BRONZE_DARK + (200,), banner.get_rect(), 3)  # type: ignore[operator]
+        pygame.draw.rect(banner, BRONZE_LIGHT + (180,), banner.get_rect().inflate(-6, -6), 1)  # type: ignore[operator]
+        self.screen.blit(banner, rect.topleft)
+
+        # Active weather summary text with faint glow
         weather = self.match.board.active_weather
         parts = []
         if weather.get(Row.MELEE):
-            parts.append("Frost (Melee)")
+            parts.append("Biting Frost")
         if weather.get(Row.RANGED):
-            parts.append("Fog (Ranged)")
+            parts.append("Impenetrable Fog")
         if weather.get(Row.SIEGE):
-            parts.append("Rain (Siege)")
+            parts.append("Torrential Rain")
         text = ", ".join(parts) if parts else "No active weather"
-        surf = self.font_small.render(text, True, (230, 230, 230))
-        tx = rect.x + (rect.width - surf.get_width()) // 2
-        ty = rect.y + (rect.height - surf.get_height()) // 2
-        self.screen.blit(surf, (tx, ty))
+
+        text_surf = self.font_medium.render(text, True, (225, 235, 245))
+        glow_surf = self.font_medium.render(text, True, (160, 190, 230))
+        tx = rect.x + (rect.width - text_surf.get_width()) // 2
+        ty = rect.y + (rect.height - text_surf.get_height()) // 2
+        self.screen.blit(glow_surf, (tx, ty + 1))
+        self.screen.blit(text_surf, (tx, ty))
 
     def _draw_combat_rows(self, player_id: str, board_rect: pygame.Rect, row_h: int, top: bool) -> None:
         board = self.match.board
         rows_order = (Row.SIEGE, Row.RANGED, Row.MELEE) if top else (Row.MELEE, Row.RANGED, Row.SIEGE)
-
-        # Total strength label per side
-        total = board.total_strength(player_id)
-        label = f"{player_id} total: {total}"
-        label_surf = self.font_medium.render(label, True, (230, 230, 230))
-        if top:
-            lx = board_rect.x + (board_rect.width - label_surf.get_width()) // 2
-            ly = board_rect.y - 30
-        else:
-            lx = board_rect.x + (board_rect.width - label_surf.get_width()) // 2
-            ly = board_rect.bottom + 5
-        self.screen.blit(label_surf, (lx, ly))
 
         start_index = 0 if top else 4
         for i, row in enumerate(rows_order):
             band_index = start_index + i
             band_y = board_rect.y + band_index * row_h
 
-            # Row lane
+            # Row lane – recessed wooden trough, with a bit more breathing room
             row_rect = pygame.Rect(
-                board_rect.x + 80,
-                band_y + 6,
-                board_rect.width - 120,
-                row_h - 12,
+                board_rect.x + 90,
+                band_y + 8,
+                board_rect.width - 140,
+                row_h - 16,
             )
-            pygame.draw.rect(self.screen, (55, 40, 26), row_rect)
-            pygame.draw.rect(self.screen, (140, 110, 60), row_rect, 1)
+            pygame.draw.rect(self.screen, WOOD_MID, row_rect)
+            inner_row = row_rect.inflate(-8, -8)
+            pygame.draw.rect(self.screen, WOOD_DARK, inner_row)
+            pygame.draw.rect(self.screen, BRONZE_DARK, row_rect, 4)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, inner_row, 1)
+
+            # Cache lane rect for drag-and-drop hit testing (only for P1 side)
+            if not top:
+                self.row_lane_rects[(player_id, row)] = row_rect.copy()
 
             rs = board.rows[player_id][row]
 
-            # Effect slot on the left of the lane
+            # Effect / row icon slot on the left of the lane
             effect_rect = pygame.Rect(
                 board_rect.x + 30,
-                row_rect.y + (row_rect.height - 40) // 2,
-                40,
-                40,
+                row_rect.y + (row_rect.height - 52) // 2,
+                44,
+                52,
             )
-            pygame.draw.rect(self.screen, (90, 70, 40), effect_rect)
-            pygame.draw.rect(self.screen, (140, 110, 60), effect_rect, 1)
+            pygame.draw.rect(self.screen, WOOD_DARK, effect_rect)
+            inner_eff = effect_rect.inflate(-6, -6)
+            pygame.draw.rect(self.screen, BRONZE_MID, effect_rect, 3)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, inner_eff, 1)
 
-            # Row label and strength
+            # Row icon watermark instead of text label
+            icon = "⚔"
+            if row == Row.RANGED:
+                icon = "🏹"
+            elif row == Row.SIEGE:
+                icon = "⛨"
+            icon_surf = self.font_medium.render(icon, True, (240, 230, 215))
+            ix = effect_rect.x + (effect_rect.width - icon_surf.get_width()) // 2
+            iy = effect_rect.y + (effect_rect.height - icon_surf.get_height()) // 2
+            self.screen.blit(icon_surf, (ix, iy))
+
+            # Row strength in a bronze medallion on the far left
             strength = board.row_strength(player_id, row)
-            row_label = f"{row.value}"
-            txt = self.font_small.render(row_label, True, (230, 230, 210))
-            self.screen.blit(txt, (effect_rect.x + 4, effect_rect.y + 4))
+            badge_r = 20
+            badge_center = (board_rect.x - 16, row_rect.y + row_rect.height // 2)
+            med = pygame.Surface((badge_r * 2, badge_r * 2), pygame.SRCALPHA)  # type: ignore[attr-defined]
+            center = (badge_r, badge_r)
+            pygame.draw.circle(med, BRONZE_MID + (255,), center, badge_r)
+            pygame.draw.circle(med, BRONZE_LIGHT + (255,), center, badge_r - 3)
+            pygame.draw.circle(med, BRONZE_DARK + (255,), center, badge_r, 2)
+            str_surf = self.font_small.render(str(strength), True, (15, 8, 0))
+            med.blit(
+                str_surf,
+                (center[0] - str_surf.get_width() // 2, center[1] - str_surf.get_height() // 2),
+            )
+            self.screen.blit(med, (badge_center[0] - badge_r, badge_center[1] - badge_r))
 
-            str_surf = self.font_small.render(str(strength), True, (255, 245, 220))
-            self.screen.blit(str_surf, (row_rect.right - str_surf.get_width() - 8, row_rect.y + 4))
-
-            # Row effect icons in effect slot
+            # Row effect runes in effect slot
             badge_y = effect_rect.y + effect_rect.height - 18
-            badge_x = effect_rect.x + 4
+            badge_x = effect_rect.x + 6
             if rs.weather_active:
-                weather_badge = self.font_small.render("W", True, (180, 220, 255))
+                weather_badge = self.font_small.render("☁", True, (190, 220, 255))
                 self.screen.blit(weather_badge, (badge_x, badge_y))
-                badge_x += 14
+                badge_x += 16
             if rs.horn_active:
-                horn_badge = self.font_small.render("x2", True, (255, 230, 180))
+                horn_badge = self.font_small.render("❖", True, (255, 235, 190))
                 self.screen.blit(horn_badge, (badge_x, badge_y))
 
             # Draw cards in row as boxes with power and name
-            x = row_rect.x + 8
-            card_w, card_h = 60, row_rect.height - 12
-            for c in rs.cards:
-                color = self._card_color(c)
-                rect = pygame.Rect(x, row_rect.y + 6, card_w, card_h)
-                pygame.draw.rect(self.screen, color, rect)
-                pygame.draw.rect(self.screen, (0, 0, 0), rect, 1)
-                # Power at top-left
-                text = self.font_small.render(str(c.power), True, (0, 0, 0))
-                self.screen.blit(text, (rect.x + 3, rect.y + 3))
-                # Truncated name along the bottom
-                name = c.name if len(c.name) <= 10 else c.name[:9] + "…"
-                name_surf = self.font_small.render(name, True, (0, 0, 0))
-                name_x = rect.x + max(2, (rect.width - name_surf.get_width()) // 2)
-                name_y = rect.y + rect.height - 16
-                self.screen.blit(name_surf, (name_x, name_y))
-                x += card_w + 8
+            # Draw row cards using shared card renderer, slightly overlapped
+            cards_in_row = list(rs.cards)
+            if cards_in_row:
+                base_w = 70
+                base_h = row_rect.height - 14
+                overlap = 22
+                total_w = base_w + overlap * (len(cards_in_row) - 1)
+                start_x = row_rect.x + (row_rect.width - total_w) // 2
+                y = row_rect.y + 7
+                for idx, c in enumerate(cards_in_row):
+                    cx = start_x + idx * overlap
+                    rect = pygame.Rect(cx, y, base_w, base_h)
+                    surf = self._render_card_surface(c, (base_w, base_h))
+                    self.screen.blit(surf, rect.topleft)
+
+    def _draw_side_panels(self, board_rect: pygame.Rect) -> None:
+        """Draw carved portrait panels on the left and deck/graveyard shelves on the right."""
+        screen_h = self.screen.get_height()
+
+        # Left vertical carved wood panel. Height chosen so bottom leader panel
+        # sits above the hand tray instead of being covered by it.
+        left_rect = pygame.Rect(20, 20, board_rect.x - 40, screen_h - 220)
+        pygame.draw.rect(self.screen, WOOD_MID, left_rect)
+        pygame.draw.rect(self.screen, BRONZE_DARK, left_rect, 4)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, left_rect.inflate(-6, -6), 1)
+
+        # Opponent portrait frame (top)
+        frame_h = 130
+        opp_frame = pygame.Rect(left_rect.x + 24, left_rect.y + 26, left_rect.width - 48, frame_h)
+        pygame.draw.rect(self.screen, WOOD_DARK, opp_frame)
+        pygame.draw.rect(self.screen, BRONZE_MID, opp_frame, 4)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, opp_frame.inflate(-6, -6), 1)
+
+        # Bottom leader / player panel is drawn by _draw_leaders_and_scores,
+        # so we don't draw a separate empty placeholder frame here.
+
+        # Right vertical panel for deck / graveyard stacked slots
+        right_rect = pygame.Rect(board_rect.right + 20, 20, self.screen.get_width() - board_rect.right - 40, screen_h - 40)
+        pygame.draw.rect(self.screen, WOOD_MID, right_rect)
+        pygame.draw.rect(self.screen, BRONZE_DARK, right_rect, 4)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, right_rect.inflate(-6, -6), 1)
+
+        # Three carved shelves for deck / graveyard / extra
+        slot_w = right_rect.width - 48
+        slot_h = 90
+        top_y = right_rect.y + 40
+        gap = 40
+        for i in range(3):
+            slot = pygame.Rect(right_rect.x + 24, top_y + i * (slot_h + gap), slot_w, slot_h)
+            if slot.bottom + 24 > right_rect.bottom:
+                break
+            pygame.draw.rect(self.screen, WOOD_DARK, slot)
+            shelf_inner = slot.inflate(-8, -8)
+            pygame.draw.rect(self.screen, BRONZE_MID, slot, 3)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, shelf_inner, 1)
+
+            # Simple stacked card silhouettes to hint deck / graveyard
+            pile_color = (60, 50, 40)
+            for offset in range(3):
+                card_rect = pygame.Rect(
+                    shelf_inner.x + 10 + offset * 6,
+                    shelf_inner.y + 8 + offset * 4,
+                    44,
+                    64,
+                )
+                pygame.draw.rect(self.screen, pile_color, card_rect, border_radius=4)  # type: ignore[arg-type]
 
     def _draw_leaders_and_scores(self, board_rect: pygame.Rect) -> None:
-        # Opponent leader and score
+        # Opponent and player summaries anchored inside the left side panel,
+        # not overlapping the main board area.
         opp = self.match.board.get_opponent("P1")
         p1 = "P1"
-        opp_leader_rect = pygame.Rect(board_rect.x - 10, board_rect.y + board_rect.height // 8, 72, 72)
-        p1_leader_rect = pygame.Rect(board_rect.x - 10, board_rect.y + board_rect.height * 5 // 8, 72, 72)
+
+        # Mirror _draw_side_panels left layout for leader plaques
+        left_panel_x = 20
+        left_panel_y = 20
+        left_panel_w = board_rect.x - 40
+
+        # Use the same vertical padding from the left background panel
+        # so P2 is offset from the top and P1 is offset equally from the bottom.
+        left_rect_top = left_panel_y
+        left_rect_bottom = self.screen.get_height() - 200  # matches left_rect height in _draw_side_panels
+        vertical_padding = 30
+        plaque_height = 80
+        plaque_width = left_panel_w - 60
+
+        # Top leader panel (P2)
+        opp_leader_x = left_panel_x + 30
+        opp_leader_y = left_rect_top + vertical_padding
+        opp_leader_rect = pygame.Rect(opp_leader_x, opp_leader_y, plaque_width, plaque_height)
+
+        # Bottom leader panel (P1) – same padding from bottom as P2 from top
+        p1_x = left_panel_x + 30
+        p1_y = left_rect_bottom - vertical_padding - plaque_height
+        p1_width = plaque_width
+        p1_height = plaque_height
+        p1_leader_rect = pygame.Rect(p1_x, p1_y, p1_width, p1_height)
 
         def draw_leader_block(player_id: str, rect: pygame.Rect) -> None:
-            pygame.draw.rect(self.screen, (50, 40, 30), rect)
-            pygame.draw.rect(self.screen, (160, 130, 70), rect, 2)
-            # Simple faction color stripe
+            # Carved leader plaque with leader card, faction stripe and score medallions
+            pygame.draw.rect(self.screen, WOOD_DARK, rect)
+            pygame.draw.rect(self.screen, BRONZE_MID, rect, 4)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, rect.inflate(-6, -6), 1)
+
             player = next(p for p in self.match.players if p.id == player_id)
+
+            # Left: miniature leader card portrait inside the plaque
+            leader_card = getattr(player, "leader", None)
+            card_area_width = rect.width // 3
+            card_margin = 6
+            card_rect = pygame.Rect(
+                rect.x + card_margin,
+                rect.y + card_margin + 6,
+                card_area_width - card_margin * 2,
+                rect.height - card_margin * 2 - 8,
+            )
+            if leader_card is not None:
+                surf = self._render_card_surface(leader_card, (card_rect.width, card_rect.height))
+                self.screen.blit(surf, card_rect.topleft)
+            else:
+                # Fallback simple wood if no leader set
+                pygame.draw.rect(self.screen, WOOD_MID, card_rect)
+                pygame.draw.rect(self.screen, BRONZE_DARK, card_rect, 2)
+
+            # Faction stripe at top of the right info area
+            info_rect = pygame.Rect(
+                card_rect.right + 6,
+                rect.y + 4,
+                rect.right - (card_rect.right + 10),
+                rect.height - 8,
+            )
             faction_color = (100, 100, 100)
-            if hasattr(player, "leader") and player.leader is not None:
-                faction_color = self._card_color(player.leader)
-            stripe = pygame.Rect(rect.x + 4, rect.y + 4, rect.width - 8, 14)
+            if leader_card is not None:
+                faction_color = self._card_color(leader_card)
+            stripe = pygame.Rect(info_rect.x, info_rect.y, info_rect.width, 12)
             pygame.draw.rect(self.screen, faction_color, stripe)
 
-            # Score / rounds next to leader
-            score_rect = pygame.Rect(rect.right + 8, rect.y, 150, rect.height)
-            pygame.draw.rect(self.screen, (30, 22, 16), score_rect)
-            pygame.draw.rect(self.screen, (140, 110, 60), score_rect, 1)
+            # Score / rounds stacked inside the right info block
+            score_rect = pygame.Rect(
+                info_rect.x + 4,
+                stripe.bottom + 4,
+                info_rect.width - 8,
+                info_rect.height - (stripe.height + 10),
+            )
+            pygame.draw.rect(self.screen, WOOD_MID, score_rect)
+            pygame.draw.rect(self.screen, BRONZE_DARK, score_rect, 2)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, score_rect.inflate(-4, -4), 1)
 
+            # Totals
             total = self.match.board.total_strength(player_id)
             lives = getattr(self.match, "lives", {}).get(player_id, 0)
             wins = getattr(self.match, "wins", {}).get(player_id, 0)
 
-            line1 = self.font_small.render(f"{player_id} Score: {total}", True, (230, 220, 200))
-            line2 = self.font_small.render(f"Wins: {wins}  Lives: {lives}", True, (210, 200, 180))
-            self.screen.blit(line1, (score_rect.x + 6, score_rect.y + 8))
-            self.screen.blit(line2, (score_rect.x + 6, score_rect.y + 8 + 20))
+            # Score medallion
+            med_r = 18
+            med_center = (score_rect.x + med_r + 4, score_rect.y + score_rect.height // 2)
+            med = pygame.Surface((med_r * 2, med_r * 2), pygame.SRCALPHA)  # type: ignore[attr-defined]
+            center = (med_r, med_r)
+            pygame.draw.circle(med, BRONZE_MID + (255,), center, med_r)
+            pygame.draw.circle(med, BRONZE_LIGHT + (255,), center, med_r - 3)
+            pygame.draw.circle(med, BRONZE_DARK + (255,), center, med_r, 2)
+            score_text = self.font_small.render(str(total), True, (15, 8, 0))
+            med.blit(
+                score_text,
+                (center[0] - score_text.get_width() // 2, center[1] - score_text.get_height() // 2),
+            )
+            self.screen.blit(med, (med_center[0] - med_r, med_center[1] - med_r))
+
+            # Round wins, lives and hand size as badges
+            label_x = med_center[0] + med_r + 12
+            label_y = score_rect.y + 4
+            # Player id label
+            label = self.font_small.render(player_id, True, (235, 225, 205))
+            self.screen.blit(label, (label_x, label_y))
+
+            # Hand size just below the id
+            hand_size = len(player.hand)
+            hand_text = self.font_small.render(f"Hand: {hand_size}", True, (235, 225, 205))
+            self.screen.blit(hand_text, (label_x, label_y + label.get_height() + 2))
+
+            # Wins (rounds) – small gold shields
+            shield_y = label_y + label.get_height() + hand_text.get_height() + 8
+            for i in range(wins):
+                sx = label_x + i * 20
+                shield = pygame.Rect(sx, shield_y, 14, 16)
+                pygame.draw.rect(self.screen, (170, 140, 80), shield)
+                pygame.draw.rect(self.screen, (90, 70, 40), shield, 1)
+
+            # Lives – small gem circles
+            gem_y = shield_y + 22
+            for i in range(lives):
+                gx = label_x + i * 20 + 8
+                pygame.draw.circle(self.screen, (120, 210, 210), (gx, gem_y), 6)
+                pygame.draw.circle(self.screen, (20, 40, 40), (gx, gem_y), 6, 1)
+
+            # Visual cue when a player has passed this round
+            if getattr(player, "passed", False):
+                # Slightly larger than normal small font, in solid black
+                passed_font = self.font_medium
+                passed_text = passed_font.render("PASSED", True, (0, 0, 0))
+                px = rect.right + 8
+                py = rect.y + (rect.height - passed_text.get_height()) // 2
+                self.screen.blit(passed_text, (px, py))
 
         draw_leader_block(opp, opp_leader_rect)
         draw_leader_block(p1, p1_leader_rect)
 
-    def _draw_status_bar(self, active_id: str) -> None:
-        # Bar with active player and round number along bottom of board
-        y = self.screen.get_height() - 180 - 36
-        rect = pygame.Rect(0, y, self.screen.get_width(), 36)
-        pygame.draw.rect(self.screen, (25, 20, 18), rect)
-        pygame.draw.rect(self.screen, (80, 60, 40), rect, 1)
+    def _draw_status_bar(self, active_id: str, board_rect: pygame.Rect) -> None:
+        """Deprecated text bar removed; kept only for PASS button placement.
 
-        lives = getattr(self.match, "lives", {})
-        wins = getattr(self.match, "wins", {})
-        txt = f"Round {self.match.round_number} | Active: {active_id} | "
-        txt += "  ".join(f"{pid} L={lives.get(pid, 0)} W={wins.get(pid, 0)}" for pid in lives)
-        surf = self.font_medium.render(txt, True, (230, 230, 230))
-        self.screen.blit(surf, (40, y + 6))
-
-        # PASS button on the right
-        self.pass_rect = pygame.Rect(self.screen.get_width() - 140, y + 4, 100, 28)
-        pygame.draw.rect(self.screen, (120, 40, 40), self.pass_rect)
+        The PASS button is now anchored to the bottom-right of the playfield,
+        similar to Witcher 3.
+        """
+        btn_w, btn_h = 110, 32
+        # Position comfortably inside the lower-right of the board,
+        # high enough to avoid overlapping the hand tray.
+        x = board_rect.right - btn_w - 14
+        # Nudge down so it sits just above the hand tray
+        y = board_rect.bottom - btn_h - 20
+        self.pass_rect = pygame.Rect(x, y, btn_w, btn_h)
+        pygame.draw.rect(self.screen, (130, 40, 40), self.pass_rect)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, self.pass_rect, 1)
         ptxt = self.font_medium.render("PASS", True, (255, 255, 255))
-        self.screen.blit(ptxt, (self.pass_rect.x + 18, self.pass_rect.y + 2))
+        self.screen.blit(ptxt, (self.pass_rect.x + (btn_w - ptxt.get_width()) // 2, self.pass_rect.y + 4))
 
     def _draw_hand(self, player_id: str) -> None:
         player = next(p for p in self.match.players if p.id == player_id)
-        y = self.screen.get_height() - 160
-        pygame.draw.rect(self.screen, (30, 22, 16), (0, y - 10, self.screen.get_width(), 170))
-        label = self.font_medium.render(f"{player.id} Hand", True, (230, 230, 230))
+        # Place hand slightly closer to the board
+        y = self.screen.get_height() - 170
+        tray_rect = pygame.Rect(0, y - 12, self.screen.get_width(), 190)
+        pygame.draw.rect(self.screen, WOOD_DARK, tray_rect)
+        pygame.draw.rect(self.screen, BRONZE_DARK, tray_rect, 2)
+        pygame.draw.rect(self.screen, BRONZE_LIGHT, tray_rect.inflate(-6, -6), 1)
+        label = self.font_medium.render(f"{player.id} Hand", True, (235, 230, 220))
         self.screen.blit(label, (40, y - 5))
 
         hand = list(player.hand)
         n = max(1, len(hand))
+        max_width = self.screen.get_width() - 200
+        # Slightly larger cards (~25-30% over original base) for readability
+        card_width = 130
+        card_height = 150
+        # Light overlap: 10–20% of card width
+        if n > 1:
+            step = min(card_width * 0.8, max_width / (n - 0.2))
+        else:
+            step = card_width
+        step = int(step)
+        # Ensure some minimum spacing
+        step = max(int(card_width * 0.5), step)
+        total_w = card_width + step * (n - 1)
+        start_x = (self.screen.get_width() - total_w) // 2
+
+        mouse_pos = pygame.mouse.get_pos()
+        self.hand_sprites = []
+        self.hovered_hand_index = None
+
+        for i, c in enumerate(hand):
+            # If this card is currently being dragged, skip drawing it in the tray;
+            # it will be drawn following the mouse instead.
+            if self.dragging_card is c:
+                continue
+
+            x = start_x + i * step
+            base_rect = pygame.Rect(x, y + 6, card_width, card_height)
+            hovered = base_rect.collidepoint(mouse_pos) and self.dragging_card is None
+            if hovered:
+                self.hovered_hand_index = i
+            # Slight lift and scale on hover; keep rect size for hit-testing
+            draw_rect = base_rect.copy()
+            if hovered:
+                draw_rect.y -= 12
+                draw_rect.inflate_ip(12, 12)
+
+            # Store logical card rect for hit-testing / dragging
+            self.hand_sprites.append(CardSprite(c, base_rect))
+
+            # Draw non-hovered cards first, then hovered last so it appears on top
+        hovered_card: Optional[Tuple[Card, pygame.Rect]] = None
+        for sprite in self.hand_sprites:
+            card = sprite.card
+            rect = sprite.rect
+            is_hovered = rect.collidepoint(mouse_pos) and self.dragging_card is None
+            draw_rect = rect.copy()
+            if is_hovered:
+                draw_rect.y -= 12
+                draw_rect.inflate_ip(12, 12)
+                hovered_card = (card, draw_rect)
+            else:
+                surf = self._render_card_surface(card, (draw_rect.width, draw_rect.height), hovered=False, selected=(self.selected_from_hand is card))
+                self.screen.blit(surf, draw_rect.topleft)
+
+        if hovered_card is not None:
+            card, draw_rect = hovered_card
+            surf = self._render_card_surface(card, (draw_rect.width, draw_rect.height), hovered=True, selected=(self.selected_from_hand is card))
+            self.screen.blit(surf, draw_rect.topleft)
+
+        # If a card is being dragged, render it following the mouse using drag_rect
+        if self.dragging_card is not None and self.drag_rect is not None:
+            w, h = self.drag_rect.width, self.drag_rect.height
+            surf = self._render_card_surface(self.dragging_card, (w, h), hovered=True, selected=True)
+            self.screen.blit(surf, self.drag_rect.topleft)
+
+    def _draw_mulligan_hand(self, player_id: str) -> None:
+        """Enlarged hand with discard buttons and confirm for mulligan phase."""
+        player = next(p for p in self.match.players if p.id == player_id)
+        y = self.screen.get_height() - 220
+
+        # Dim background slightly to focus on hand
+        overlay = pygame.Surface((self.screen.get_width(), self.screen.get_height()), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 120))
+        self.screen.blit(overlay, (0, 0))
+
+        pygame.draw.rect(self.screen, (30, 22, 16), (0, y - 20, self.screen.get_width(), 240))
+        title = self.font_medium.render("Mulligan: redraw up to 2 cards", True, (230, 230, 230))
+        self.screen.blit(title, (40, y - 16))
+
+        hand = list(player.hand)
+        n = max(1, len(hand))
         max_width = self.screen.get_width() - 80
-        card_width = 80
-        gap = min(20, (max_width - card_width) // max(1, n - 1)) if n > 1 else 0
+        card_width = 100
+        gap = min(30, (max_width - card_width) // max(1, n - 1)) if n > 1 else 0
         start_x = 40
 
         self.hand_sprites = []
+        self.mulligan_discard_buttons = []
         for i, c in enumerate(hand):
             x = start_x + i * (card_width + gap)
-            rect = pygame.Rect(x, y + 10, card_width, 120)
+            rect = pygame.Rect(x, y + 10, card_width, 150)
             self.hand_sprites.append(CardSprite(c, rect))
-            color = self._card_color(c)
-            pygame.draw.rect(self.screen, color, rect)
-            pygame.draw.rect(self.screen, (0, 0, 0), rect, 2)
+            surf = self._render_card_surface(c, (rect.width, rect.height))
+            self.screen.blit(surf, rect.topleft)
 
-            if self.selected_from_hand is c:
-                pygame.draw.rect(self.screen, (255, 215, 0), rect, 3)
+            # Discard "X" button in top-right
+            if self.mulligan_discards < self.mulligan_max_discards:
+                x_rect = pygame.Rect(rect.right - 20, rect.y + 4, 16, 16)
+                pygame.draw.rect(self.screen, (140, 40, 40), x_rect)
+                pygame.draw.rect(self.screen, (0, 0, 0), x_rect, 1)
+                x_txt = self.font_small.render("X", True, (255, 255, 255))
+                self.screen.blit(x_txt, (x_rect.x + 3, x_rect.y + 1))
+                self.mulligan_discard_buttons.append((c, x_rect))
 
-            # Power and name
-            pw = self.font_small.render(str(c.power), True, (0, 0, 0))
-            self.screen.blit(pw, (rect.x + 3, rect.y + 3))
-            name = c.name if len(c.name) <= 12 else c.name[:11] + "…"
-            nm = self.font_small.render(name, True, (0, 0, 0))
-            self.screen.blit(nm, (rect.x + 3, rect.y + rect.height - 18))
+        # Confirm button
+        btn_w, btn_h = 160, 36
+        btn_x = self.screen.get_width() - btn_w - 40
+        btn_y = y - 10
+        self.mulligan_confirm_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+        can_confirm = True  # allow confirm anytime; adjust if you want at least one redraw
+        bg = (80, 60, 40) if can_confirm else (50, 40, 30)
+        pygame.draw.rect(self.screen, bg, self.mulligan_confirm_rect)
+        pygame.draw.rect(self.screen, (140, 110, 60), self.mulligan_confirm_rect, 1)
+        label = self.font_medium.render("Confirm Hand", True, (255, 255, 255))
+        self.screen.blit(label, (btn_x + 10, btn_y + 6))
+
+    def _render_card_surface(self, card: Card, size: Tuple[int, int], *, hovered: bool = False, selected: bool = False) -> pygame.Surface:
+        """Render a single card as parchment on wood with medallions and icons.
+
+        Unit cards have parchment frames; specials use darker mystical frames.
+        """
+        w, h = size
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)  # type: ignore[attr-defined]
+
+        is_special = card.type in (CardType.SPECIAL, CardType.WEATHER)
+
+        # Base frame
+        rect = pygame.Rect(0, 0, w, h)
+        if is_special:
+            frame_col = (40, 46, 70)
+            inner_col_top = (72, 80, 110)
+            inner_col_bot = (40, 44, 70)
+        else:
+            frame_col = self._card_color(card)
+            inner_col_top = PARCHMENT_LIGHT
+            inner_col_bot = PARCHMENT_MID
+
+        pygame.draw.rect(surf, frame_col, rect, border_radius=10)  # type: ignore[arg-type]
+        inner_rect = rect.inflate(-6, -6)
+
+        # Parchment / mystical interior gradient
+        for i in range(inner_rect.height):
+            t = i / max(1, inner_rect.height - 1)
+            r = int(inner_col_top[0] + (inner_col_bot[0] - inner_col_top[0]) * t)
+            g = int(inner_col_top[1] + (inner_col_bot[1] - inner_col_top[1]) * t)
+            b = int(inner_col_top[2] + (inner_col_bot[2] - inner_col_top[2]) * t)
+            pygame.draw.line(
+                surf,
+                (r, g, b),
+                (inner_rect.x, inner_rect.y + i),
+                (inner_rect.right, inner_rect.y + i),
+            )
+
+        # Worn edges
+        pygame.draw.rect(surf, (150, 135, 110), inner_rect, 1)
+
+        # Hover / selection glow
+        if hovered:
+            glow = pygame.Surface((w, h), pygame.SRCALPHA)  # type: ignore[attr-defined]
+            glow.fill(GLOW_GOLD + (60,))  # type: ignore[operator]
+            surf.blit(glow, (0, 0))
+        if selected:
+            pygame.draw.rect(surf, GLOW_GOLD, rect, 3, border_radius=12)  # type: ignore[arg-type]
+
+        # Strength medallion (top-left) for units
+        if card.type == CardType.UNIT:
+            badge_r = max(10, h // 9)
+            badge_center = (inner_rect.x + badge_r + 2, inner_rect.y + badge_r + 2)
+            med = pygame.Surface((badge_r * 2, badge_r * 2), pygame.SRCALPHA)  # type: ignore[attr-defined]
+            center = (badge_r, badge_r)
+            pygame.draw.circle(med, BRONZE_MID + (255,), center, badge_r)
+            pygame.draw.circle(med, BRONZE_LIGHT + (255,), center, badge_r - 2)
+            pygame.draw.circle(med, BRONZE_DARK + (255,), center, badge_r, 2)
+            pw_text = self.font_small.render(str(card.power), True, (20, 10, 0))
+            med.blit(
+                pw_text,
+                (center[0] - pw_text.get_width() // 2, center[1] - pw_text.get_height() // 2),
+            )
+            surf.blit(med, (badge_center[0] - badge_r, badge_center[1] - badge_r))
+
+        # Row icon (bottom-right)
+        icon_size = max(14, h // 10)
+        icon_rect = pygame.Rect(0, 0, icon_size, icon_size)
+        icon_rect.bottom = inner_rect.bottom - 4
+        icon_rect.right = inner_rect.right - 4
+        pygame.draw.rect(surf, (95, 80, 60), icon_rect, border_radius=4)  # type: ignore[arg-type]
+        row_symbol = "?"
+        if card.row == Row.MELEE:
+            row_symbol = "⚔"
+        elif card.row == Row.RANGED:
+            row_symbol = "🏹"
+        elif card.row == Row.SIEGE:
+            row_symbol = "⛨"
+        icon_text = self.font_small.render(row_symbol, True, (235, 235, 230))
+        surf.blit(
+            icon_text,
+            (
+                icon_rect.x + (icon_rect.width - icon_text.get_width()) // 2,
+                icon_rect.y + (icon_rect.height - icon_text.get_height()) // 2,
+            ),
+        )
+
+        # Central art placeholder – slightly darker strip
+        art_margin_y = inner_rect.height // 5
+        art_rect = pygame.Rect(
+            inner_rect.x + 6,
+            inner_rect.y + art_margin_y,
+            inner_rect.width - 12,
+            inner_rect.height - art_margin_y * 2 - 22,
+        )
+        art_col = (170, 158, 132) if not is_special else (70, 80, 110)
+        pygame.draw.rect(surf, art_col, art_rect, border_radius=6)  # type: ignore[arg-type]
+
+        # Special symbol for specials/weather
+        if is_special:
+            symbol = "★"
+            name_lower = card.name.lower()
+            if "frost" in name_lower or "fog" in name_lower or "rain" in name_lower or "storm" in name_lower:
+                symbol = "☁"
+            elif "decoy" in name_lower:
+                symbol = "♜"
+            elif "horn" in name_lower:
+                symbol = "♩"
+            sym_surf = self.font_medium.render(symbol, True, (230, 235, 250))
+            sx = art_rect.x + (art_rect.width - sym_surf.get_width()) // 2
+            sy = art_rect.y + (art_rect.height - sym_surf.get_height()) // 2
+            surf.blit(sym_surf, (sx, sy))
+
+        # Name ribbon at bottom
+        banner_h = 18
+        banner_rect = pygame.Rect(
+            inner_rect.x + 6,
+            inner_rect.bottom - banner_h - 4,
+            inner_rect.width - 12,
+            banner_h,
+        )
+        pygame.draw.rect(surf, (166, 138, 96), banner_rect)
+        pygame.draw.rect(surf, (110, 82, 52), banner_rect, 1)
+        name = card.name if len(card.name) <= 16 else card.name[:15] + "…"
+        name_surf = self.font_small.render(name, True, (30, 18, 4))
+        surf.blit(
+            name_surf,
+            (
+                banner_rect.x + (banner_rect.width - name_surf.get_width()) // 2,
+                banner_rect.y + (banner_rect.height - name_surf.get_height()) // 2,
+            ),
+        )
+
+        return surf
 
     def _card_color(self, c: Card) -> Tuple[int, int, int]:
         # Simple faction-based coloring
@@ -397,6 +875,7 @@ class VisualUI:
     # Main loop
     # -----------------------
     def run(self) -> None:
+        # Start first round; mulligan happens before any turns are taken
         self.match.start_round()
         running = True
         while running:
@@ -408,31 +887,49 @@ class VisualUI:
                     running = False
                 elif event.type == pygame.MOUSEBUTTONDOWN:  # type: ignore[attr-defined]
                     if event.button == 1:
-                        self._on_click(event.pos)
+                        # Start drag from hand if clicking a card; otherwise
+                        # fall back to the old click behaviour (pass, overlays).
+                        self._on_mouse_down(event.pos)
                     elif event.button == 3:
                         self._on_right_click(event.pos)
+                elif event.type == pygame.MOUSEMOTION:  # type: ignore[attr-defined]
+                    self._on_mouse_motion(event.pos, event.rel, event.buttons)
+                elif event.type == pygame.MOUSEBUTTONUP:  # type: ignore[attr-defined]
+                    if event.button == 1:
+                        self._on_mouse_up(event.pos)
 
-            # AI turn with small random delay between moves; once you pass,
-            # the AI will continue taking turns until it also passes or round ends.
-            rnd = self.match.current_round
-            if self.ai and rnd and not rnd.finished and rnd.active_player.id == self.ai_player_id:
-                if self.ai_wait_timer <= 0:
-                    # Start a new wait in frames (1-5 seconds)
-                    delay_seconds = random.uniform(1.0, 5.0)
-                    self.ai_wait_timer = delay_seconds * FPS
-                else:
-                    self.ai_wait_timer -= 1
+            # During mulligan, skip AI logic entirely
+            if self.phase != "mulligan":
+                # AI turn with small random delay between moves; once you pass,
+                # the AI will continue taking turns until it also passes or round ends.
+                rnd = self.match.current_round
+                if self.ai and rnd and not rnd.finished and rnd.active_player.id == self.ai_player_id:
                     if self.ai_wait_timer <= 0:
-                        action = self.ai.choose_action(self.match)
-                        player = rnd.active_player
-                        if action.kind == "pass":
-                            self.match.pass_turn(player)
-                        elif action.kind == "play" and action.card is not None:
-                            # Let engine raise if something is invalid; we don't silently catch here
-                            self.match.play_card(player, action.card, target_row=action.target_row, target_unit=action.target_unit)
-                        # After an AI move, immediately prepare the next delay so it
-                        # will keep going on its subsequent turns.
-                        self.ai_wait_timer = 0
+                        # Start a new wait in frames (0.3-2.0 seconds)
+                        delay_seconds = random.uniform(0.3, 2.0)
+                        self.ai_wait_timer = delay_seconds * FPS
+                    else:
+                        self.ai_wait_timer -= 1
+                        if self.ai_wait_timer <= 0:
+                            action = self.ai.choose_action(self.match)
+                            player = rnd.active_player
+                            if action.kind == "pass":
+                                self.match.pass_turn(player)
+                            elif action.kind == "play" and action.card is not None:
+                                # Guard AI play so engine errors don't close the UI
+                                try:
+                                    self.match.play_card(
+                                        player,
+                                        action.card,
+                                        target_row=action.target_row,
+                                        target_unit=action.target_unit,
+                                    )
+                                except Exception as exc:
+                                    # For now just print; could render a small status message instead
+                                    print(f"[AI ERROR] {type(exc).__name__}: {exc}")
+                            # After an AI move, immediately prepare the next delay so it
+                            # will keep going on its subsequent turns.
+                            self.ai_wait_timer = 0
 
             if self.match.match_winner():
                 # Simple end condition: pause briefly then exit
@@ -445,7 +942,12 @@ class VisualUI:
 
         pygame.quit()  # type: ignore[attr-defined]
 
-    def _on_click(self, pos: Tuple[int, int]) -> None:
+    def _on_mouse_down(self, pos: Tuple[int, int]) -> None:
+        # Mulligan phase: handle discards and confirm hand
+        if self.phase == "mulligan":
+            self._handle_mulligan_click(pos)
+            return
+
         # If we're choosing a row for a card, clicks go to that handler
         if self.pending_row_choice is not None:
             self._handle_row_choice_click(pos)
@@ -454,7 +956,7 @@ class VisualUI:
         if self.info_card is not None:
             self.info_card = None
             return
-        # PASS button
+        # PASS button (still reacts to simple click)
         if self.pass_rect and self.pass_rect.collidepoint(pos):
             rnd = self.match.current_round
             if rnd:
@@ -463,33 +965,100 @@ class VisualUI:
                     self.match.pass_turn(player)
             return
 
-        # Hand cards
-        for sprite in getattr(self, "hand_sprites", []):
-            if sprite.rect.collidepoint(pos):
-                # Select or play immediately / with row selection
-                self.selected_from_hand = sprite.card
-                rnd = self.match.current_round
-                if rnd and rnd.active_player.id == "P1":
-                    card = sprite.card
+        # Start drag from hand for active human player who has not passed
+        rnd = self.match.current_round
+        if rnd and rnd.active_player.id == "P1" and not rnd.active_player.passed:
+            for sprite in getattr(self, "hand_sprites", []):
+                if sprite.rect.collidepoint(pos):
+                    self.dragging_card = sprite.card
+                    # Center drag rect on click position with same size as sprite
+                    self.drag_rect = sprite.rect.copy()
+                    dx = pos[0] - self.drag_rect.x
+                    dy = pos[1] - self.drag_rect.y
+                    self.drag_offset = (dx, dy)
+                    # Do not immediately play the card; wait for drop.
+                    return
+
+    def _on_mouse_motion(self, pos: Tuple[int, int], rel: Tuple[int, int], buttons: Tuple[int, int, int]) -> None:
+        # If dragging, update the drag rectangle to follow the cursor
+        if self.dragging_card is not None and self.drag_rect is not None and buttons[0]:
+            self.drag_rect.x = pos[0] - self.drag_offset[0]
+            self.drag_rect.y = pos[1] - self.drag_offset[1]
+
+    def _on_mouse_up(self, pos: Tuple[int, int]) -> None:
+        # If we were dragging a card, resolve drop
+        if self.dragging_card is not None:
+            card = self.dragging_card
+            drop_handled = False
+
+            # Only allow playing on your own turn, and not after passing
+            rnd = self.match.current_round
+            if rnd and rnd.active_player.id == "P1" and not rnd.active_player.passed:
+                # Determine which lane was targeted by the drop (if any)
+                dropped_row: Optional[Row] = None
+                for (pid, row), lane_rect in self.row_lane_rects.items():
+                    if pid == "P1" and lane_rect.collidepoint(pos):
+                        dropped_row = row
+                        break
+
+                if dropped_row is not None:
+                    # Work out whether this card is allowed in the dropped row.
+                    # Units may have a fixed row or multiple combat_rows; specials
+                    # typically don't care about row so we let the engine handle those.
+                    allowed_rows: Optional[List[Row]] = None
                     combat_rows = getattr(card, "combat_rows", None)
-                    if combat_rows and card.row == Row.ALL:
-                        # Multi-row unit: ask player to choose
-                        rows = [r for r in combat_rows if r in (Row.MELEE, Row.RANGED, Row.SIEGE)]
-                        if len(rows) == 1:
-                            # Only one valid row, just play it
-                            self.match.play_card(rnd.active_player, card, target_row=rows[0])
-                            self.selected_from_hand = None
-                        elif rows:
-                            self.pending_row_choice = (card, rows)
-                        else:
-                            # Fallback: let engine decide
-                            self.match.play_card(rnd.active_player, card, target_row=None)
-                            self.selected_from_hand = None
+                    if combat_rows and getattr(card, "row", None) == Row.ALL:
+                        allowed_rows = [r for r in combat_rows if r in (Row.MELEE, Row.RANGED, Row.SIEGE)]
                     else:
-                        target_row = card.row if card.row in (Row.MELEE, Row.RANGED, Row.SIEGE) else None
-                        self.match.play_card(rnd.active_player, card, target_row=target_row)
-                        self.selected_from_hand = None
-                return
+                        base_row = getattr(card, "row", None)
+                        if base_row in (Row.MELEE, Row.RANGED, Row.SIEGE):
+                            allowed_rows = [base_row]
+
+                    # If allowed_rows is not None, enforce that the dropped row is valid
+                    if allowed_rows is not None and dropped_row not in allowed_rows:
+                        # Invalid row for this card; treat as cancelled drag
+                        pass
+                    else:
+                        try:
+                            self.match.play_card(rnd.active_player, card, target_row=dropped_row)
+                            drop_handled = True
+                        except Exception as exc:
+                            print(f"[PLAY ERROR] {type(exc).__name__}: {exc}")
+
+            # Reset drag state; if drop_handled is False, card simply remains in hand
+            self.dragging_card = None
+            self.drag_rect = None
+            self.drag_offset = (0, 0)
+
+            # If we didn't play the card, leave selection untouched
+            if drop_handled:
+                self.selected_from_hand = None
+
+            return
+
+    def _handle_mulligan_click(self, pos: Tuple[int, int]) -> None:
+        # Confirm hand button
+        if self.mulligan_confirm_rect and self.mulligan_confirm_rect.collidepoint(pos):
+            # End mulligan and move to normal play
+            self.phase = "play"
+            return
+
+        # Discard icons (limit by mulligan_max_discards)
+        if self.mulligan_discards >= self.mulligan_max_discards:
+            return
+
+        player = next(p for p in self.match.players if p.id == "P1")
+        for card, rect in self.mulligan_discard_buttons:
+            if rect.collidepoint(pos) and card in player.hand:
+                # Remove from hand and draw a replacement from deck if possible
+                player.hand.remove(card)
+                deck = getattr(player, "deck", None) or []
+                if deck:
+                    # Simple top-of-deck draw
+                    new_card = deck.pop(0)
+                    player.hand.append(new_card)
+                self.mulligan_discards += 1
+                break
 
     def _handle_row_choice_click(self, pos: Tuple[int, int]) -> None:
         if self.pending_row_choice is None:
@@ -500,7 +1069,10 @@ class VisualUI:
             if rect.collidepoint(pos):
                 rnd = self.match.current_round
                 if rnd and rnd.active_player.id == "P1":
-                    self.match.play_card(rnd.active_player, card, target_row=r)
+                    try:
+                        self.match.play_card(rnd.active_player, card, target_row=r)
+                    except Exception as exc:
+                        print(f"[PLAY ERROR] {type(exc).__name__}: {exc}")
                 self.pending_row_choice = None
                 self.selected_from_hand = None
                 return
@@ -522,11 +1094,129 @@ class VisualUI:
 
 
 def start_visual_ui() -> None:
-    cards = load_cards()
-    # For first version, reuse text setup menu in console
-    match, _leader_map = setup_match_via_menu(cards)
+    pygame.init()
+    screen = pygame.display.set_mode(WINDOW_SIZE)
+    pygame.display.set_caption("Gwent - Setup")
+    clock = pygame.time.Clock()
 
-    # Simple choice: P1 human, P2 AI (can be extended later)
+    font_title = pygame.font.SysFont("arial", 32, bold=True)
+    font_label = pygame.font.SysFont("arial", 22)
+    font_small = pygame.font.SysFont("arial", 18)
+
+    cards = load_cards()
+    all_leaders = [c for c in cards if c.type == CardType.LEADER]
+    if not all_leaders:
+        raise RuntimeError("No leader cards available.")
+
+    factions = sorted({c.faction for c in all_leaders})
+
+    def build_auto_deck(faction) -> Tuple[List[Card], Card]:
+        leaders = [c for c in all_leaders if c.faction == faction] or all_leaders[:]
+        leader = leaders[0]
+        all_units = [c for c in cards if c.type == CardType.UNIT]
+        all_specials = [c for c in cards if c.type in (CardType.SPECIAL, CardType.WEATHER)]
+        units_pool = [c for c in all_units if c.faction == faction or c.faction.value == "neutral"]
+        specials_pool = [c for c in all_specials if c.faction == faction or c.faction.value == "neutral"]
+        random.shuffle(units_pool)
+        random.shuffle(specials_pool)
+        chosen_units = units_pool[:22]
+        chosen_specials = specials_pool[:8]
+        deck = chosen_units + chosen_specials
+        random.shuffle(deck)
+        return deck, leader
+
+    selected_faction_index = 0
+    deck_mode_index = 0  # 0 = Auto, 1 = Manual (NYI, treated as Auto)
+    start_button_rect: Optional[pygame.Rect] = None
+
+    running = True
+    while running:
+        clock.tick(FPS)
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:  # type: ignore[attr-defined]
+                pygame.quit()  # type: ignore[attr-defined]
+                return
+            elif event.type == pygame.KEYDOWN:  # type: ignore[attr-defined]
+                if event.key == pygame.K_ESCAPE:  # type: ignore[attr-defined]
+                    pygame.quit()  # type: ignore[attr-defined]
+                    return
+                if event.key in (pygame.K_LEFT, pygame.K_a):  # type: ignore[attr-defined]
+                    selected_faction_index = (selected_faction_index - 1) % len(factions)
+                if event.key in (pygame.K_RIGHT, pygame.K_d):  # type: ignore[attr-defined]
+                    selected_faction_index = (selected_faction_index + 1) % len(factions)
+                if event.key in (pygame.K_UP, pygame.K_DOWN, pygame.K_w, pygame.K_s):  # type: ignore[attr-defined]
+                    deck_mode_index = 1 - deck_mode_index
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE):  # type: ignore[attr-defined]
+                    if start_button_rect and start_button_rect.collidepoint(pygame.mouse.get_pos()):
+                        running = False
+            elif event.type == pygame.MOUSEBUTTONDOWN:  # type: ignore[attr-defined]
+                if event.button == 1 and start_button_rect and start_button_rect.collidepoint(event.pos):
+                    running = False
+
+        screen.fill((10, 10, 20))
+
+        title = font_title.render("Gwent - Pre-game Setup", True, (230, 230, 230))
+        screen.blit(title, ((WINDOW_SIZE[0] - title.get_width()) // 2, 40))
+
+        # Faction selection
+        faction_label = font_label.render("Faction (P1):", True, (220, 220, 220))
+        screen.blit(faction_label, (120, 140))
+        cur_faction = factions[selected_faction_index]
+        faction_text = font_label.render(cur_faction.value.capitalize(), True, (255, 235, 180))
+        screen.blit(faction_text, (360, 140))
+        hint = font_small.render("Use ← → to change faction", True, (200, 200, 200))
+        screen.blit(hint, (120, 175))
+
+        # Deck mode (currently only Auto is implemented)
+        deck_label = font_label.render("Deck Mode:", True, (220, 220, 220))
+        screen.blit(deck_label, (120, 230))
+        modes = ["Auto (22 units / 8 specials)", "Manual (not yet implemented)"]
+        for idx, txt in enumerate(modes):
+            color = (255, 255, 255) if idx == deck_mode_index else (180, 180, 180)
+            surf = font_small.render(txt, True, color)
+            screen.blit(surf, (360, 230 + idx * 28))
+        mode_hint = font_small.render("Use ↑ ↓ to toggle mode", True, (200, 200, 200))
+        screen.blit(mode_hint, (120, 300))
+
+        # Start button
+        btn_w, btn_h = 220, 50
+        btn_x = (WINDOW_SIZE[0] - btn_w) // 2
+        btn_y = 360
+        start_button_rect = pygame.Rect(btn_x, btn_y, btn_w, btn_h)
+        pygame.draw.rect(screen, (60, 100, 60), start_button_rect)
+        pygame.draw.rect(screen, (200, 230, 200), start_button_rect, 2)
+        start_txt = font_label.render("Start Match", True, (255, 255, 255))
+        screen.blit(start_txt, (btn_x + (btn_w - start_txt.get_width()) // 2, btn_y + 10))
+
+        info = font_small.render("Press Esc to quit", True, (200, 200, 200))
+        screen.blit(info, (20, WINDOW_SIZE[1] - 30))
+
+        pygame.display.flip()
+
+    # Build players and match based on selected faction (P2 uses random faction auto deck)
+    p1_faction = factions[selected_faction_index]
+    p1_full_deck, _p1_leader = build_auto_deck(p1_faction)
+    # Starting hand of 10
+    tmp = list(p1_full_deck)
+    random.shuffle(tmp)
+    p1_hand = tmp[:10]
+    p1_deck_rest = tmp[10:]
+
+    # P2: pick a random faction and auto deck
+    p2_faction = random.choice(factions)
+    p2_full_deck, _p2_leader = build_auto_deck(p2_faction)
+    tmp2 = list(p2_full_deck)
+    random.shuffle(tmp2)
+    p2_hand = tmp2[:10]
+    p2_deck_rest = tmp2[10:]
+
+    p1 = Player(id="P1", deck=p1_deck_rest, hand=p1_hand)
+    p2 = Player(id="P2", deck=p2_deck_rest, hand=p2_hand)
+    match = Match([p1, p2])
+    match.board.decks[p1.id].extend(p1_full_deck)
+    match.board.decks[p2.id].extend(p2_full_deck)
+
+    # Now hand off to main Visual UI (P2 is AI)
     ui = VisualUI(match, ai_player_id="P2")
     ui.run()
 

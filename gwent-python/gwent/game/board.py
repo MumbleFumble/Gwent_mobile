@@ -168,6 +168,13 @@ class Board:
         # Agile or multi-row unit: choose best row when not specified (row==ALL)
         if getattr(card, "combat_rows", None) and chosen_row == Row.ALL:
             chosen_row = self._best_row_for_unit(player, card)
+        # FINAL safety net: never validate with Row.ALL
+        if chosen_row == Row.ALL:
+            if card.is_unit:
+                chosen_row = self._best_row_for_unit(player, card)
+            else:
+                # Fallback for odd specials/others: default to melee
+                chosen_row = Row.MELEE
         # Validate final row for placement
         if chosen_row not in self.rows[player]:
             raise ValueError(f"Invalid row {chosen_row} for player {player}")
@@ -269,6 +276,10 @@ class Board:
                 self._on_unit_removed(p, c, r)
 
     def row_strength(self, player: str, row: Row) -> int:
+        # Some cards conceptually use Row.ALL; treat that as 0 for
+        # strength purposes and let callers sum per-lane rows instead.
+        if row not in self.rows[player]:
+            return 0
         return self.rows[player][row].effective_strength()
 
     def total_strength(self, player: str) -> int:

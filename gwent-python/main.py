@@ -9,22 +9,18 @@ Later, this should:
 
 from typing import NoReturn
 
-from gwent.ui.text_ui import start_text_ui
 from gwent.ui.visual_ui import start_visual_ui
 
 
 def main() -> NoReturn:
-    print("=== Gwent (Witcher 3 Minigame) ===")
-    print("Select UI mode:")
-    print("  1) Text UI (terminal)")
-    print("  2) Visual UI (PyGame)")
+    """Launch the visual PyGame UI directly.
 
-    choice = input("Enter 1 or 2: ").strip()
-    if choice == "2":
-        start_visual_ui()
-    else:
-        print("Launching Text UI. Type 'help' for commands.")
-        start_text_ui()
+    Text UI is still available via gwent.ui.text_ui:start_text_ui if needed,
+    but running this script will go straight into the graphical client.
+    """
+    print("=== Gwent (Witcher 3 Minigame) ===")
+    print("Launching Visual UI...")
+    start_visual_ui()
     print("Goodbye, Gwent player.")
 
 

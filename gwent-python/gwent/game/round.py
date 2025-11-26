@@ -21,7 +21,20 @@ class Round:
 		return self.players[self.turn_index]
 
 	def next_player(self) -> None:
-		self.turn_index = (self.turn_index + 1) % len(self.players)
+		# Do not advance turns if the round is already finished.
+		if self.finished:
+			return
+
+		start_index = self.turn_index
+		while True:
+			self.turn_index = (self.turn_index + 1) % len(self.players)
+			# If we've come full circle, let _check_auto_end decide about finishing.
+			if self.turn_index == start_index:
+				break
+			candidate = self.players[self.turn_index]
+			# Only stop on a player who has not passed and still has cards.
+			if not candidate.passed and candidate.hand:
+				break
 
 
 	def play_card(self, player: Player, card: Card, target_row=None, target_unit: Optional[Card] = None) -> None:
@@ -40,7 +53,8 @@ class Round:
 	def pass_turn(self, player: Player) -> None:
 		player.pass_round()
 		self._check_auto_end()
-		self.next_player()
+		if not self.finished:
+			self.next_player()
 
 	def _check_auto_end(self) -> None:
 		if all(p.passed or not p.hand for p in self.players):

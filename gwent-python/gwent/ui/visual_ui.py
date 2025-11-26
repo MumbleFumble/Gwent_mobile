@@ -86,6 +86,23 @@ class VisualUI:
 
         # Cached lane rects for hit-testing drops: (player_id, row) -> Rect
         self.row_lane_rects: Dict[Tuple[str, Row], pygame.Rect] = {}
+        # Cached rects of cards currently rendered on the board rows so we
+        # can show info on right-click even after they are played
+        self.board_card_rects: List[Tuple[Card, pygame.Rect]] = []
+        # Deck UI / animation state
+        self.deck_hover: bool = False
+        self.deck_pile_rect: Optional[pygame.Rect] = None
+        self.deck_draw_progress: float = 0.0
+        self.deck_draw_card: Optional[Card] = None
+        self.deck_draw_from: Optional[Tuple[int, int]] = None
+        self.deck_draw_to: Optional[Tuple[int, int]] = None
+        # Graveyard UI / animation state
+        self.grave_hover: bool = False
+        self.grave_pile_rect: Optional[pygame.Rect] = None
+        self.grave_anim_progress: float = 0.0
+        self.grave_anim_card: Optional[Card] = None
+        self.grave_anim_from: Optional[Tuple[int, int]] = None
+        self.grave_anim_to: Optional[Tuple[int, int]] = None
 
     # -----------------------
     # Drawing helpers
@@ -136,6 +153,9 @@ class VisualUI:
         # Divide board into 7 horizontal bands (3 opp rows, thin weather, 3 player rows)
         row_h = int(board_rect.height // 7 * 0.95)
 
+        # Clear per-frame board card hit-test cache
+        self.board_card_rects = []
+
         # Weather/effects strip in the middle (very slim)
         self._draw_weather_strip(board_rect, row_h)
 
@@ -152,7 +172,7 @@ class VisualUI:
         # Leaders and scores overlaid near left portraits
         self._draw_leaders_and_scores(board_rect)
 
-        # PASS button anchored to bottom-right of board
+        # PASS button and simple status anchored near bottom-right of board
         self._draw_status_bar(active_id, board_rect)
 
         # Player hand / mulligan (now sits directly under board)
@@ -160,6 +180,37 @@ class VisualUI:
             self._draw_mulligan_hand("P1")
         else:
             self._draw_hand("P1")
+
+        # Deck draw animation overlay (card sliding into hand)
+        if self.deck_draw_card is not None and self.deck_draw_from and self.deck_draw_to:
+            t = max(0.0, min(1.0, self.deck_draw_progress))
+            sx, sy = self.deck_draw_from
+            ex, ey = self.deck_draw_to
+            cx = int(sx + (ex - sx) * t)
+            cy = int(sy + (ey - sy) * t)
+            w, h = 80, 110
+            surf = self._render_card_surface(self.deck_draw_card, (w, h))
+            rect = surf.get_rect(center=(cx, cy))
+            # Slight shadow under flying card
+            shadow = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            pygame.draw.ellipse(shadow, (0, 0, 0, 90), shadow.get_rect().inflate(8, 18))
+            self.screen.blit(shadow, (rect.x, rect.y + rect.height // 2))
+            self.screen.blit(surf, rect.topleft)
+
+        # Graveyard discard animation overlay (card sliding into graveyard pile)
+        if self.grave_anim_card is not None and self.grave_anim_from and self.grave_anim_to:
+            t = max(0.0, min(1.0, self.grave_anim_progress))
+            sx, sy = self.grave_anim_from
+            ex, ey = self.grave_anim_to
+            cx = int(sx + (ex - sx) * t)
+            cy = int(sy + (ey - sy) * t)
+            w, h = 72, 102
+            surf = self._render_card_back_surface((w, h), muted=True)
+            rect = surf.get_rect(center=(cx, cy))
+            shadow = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+            pygame.draw.ellipse(shadow, (0, 0, 0, 120), shadow.get_rect().inflate(10, 22))
+            self.screen.blit(shadow, (rect.x, rect.y + rect.height // 2))
+            self.screen.blit(surf, rect.topleft)
 
         # Optional card info overlay
         if self.info_card is not None:
@@ -304,9 +355,15 @@ class VisualUI:
                     rect = pygame.Rect(cx, y, base_w, base_h)
                     surf = self._render_card_surface(c, (base_w, base_h))
                     self.screen.blit(surf, rect.topleft)
+                    # Remember this rect for right-click info lookup
+                    self.board_card_rects.append((c, rect))
 
     def _draw_side_panels(self, board_rect: pygame.Rect) -> None:
-        """Draw carved portrait panels on the left and deck/graveyard shelves on the right."""
+        """Draw carved portrait panels on the left and deck/graveyard shelves on the right.
+
+        Right stacks show P2 (top) and P1 (bottom) deck/graveyard
+        separately, mirroring the board layout.
+        """
         screen_h = self.screen.get_height()
 
         # Left vertical carved wood panel. Height chosen so bottom leader panel
@@ -316,46 +373,150 @@ class VisualUI:
         pygame.draw.rect(self.screen, BRONZE_DARK, left_rect, 4)
         pygame.draw.rect(self.screen, BRONZE_LIGHT, left_rect.inflate(-6, -6), 1)
 
-        # Opponent portrait frame (top)
+        # Top and bottom frames for the leader panels (P2 and P1) so they
+        # share the same outer carved box. Both use the same 26px vertical
+        # inset from the top/bottom of the carved column for symmetry.
         frame_h = 130
         opp_frame = pygame.Rect(left_rect.x + 24, left_rect.y + 26, left_rect.width - 48, frame_h)
-        pygame.draw.rect(self.screen, WOOD_DARK, opp_frame)
-        pygame.draw.rect(self.screen, BRONZE_MID, opp_frame, 4)
-        pygame.draw.rect(self.screen, BRONZE_LIGHT, opp_frame.inflate(-6, -6), 1)
+        # Drop the bottom frame so it hugs the dark backing box
+        p1_frame_top = left_rect.bottom - frame_h - 46
+        p1_frame = pygame.Rect(left_rect.x + 24, p1_frame_top, left_rect.width - 48, frame_h)
+        for frame in (opp_frame, p1_frame):
+            pygame.draw.rect(self.screen, WOOD_DARK, frame)
+            pygame.draw.rect(self.screen, BRONZE_MID, frame, 4)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, frame.inflate(-6, -6), 1)
 
-        # Bottom leader / player panel is drawn by _draw_leaders_and_scores,
-        # so we don't draw a separate empty placeholder frame here.
-
-        # Right vertical panel for deck / graveyard stacked slots
+        # Right vertical panel for deck / graveyard stacked slots (covers both players)
         right_rect = pygame.Rect(board_rect.right + 20, 20, self.screen.get_width() - board_rect.right - 40, screen_h - 40)
         pygame.draw.rect(self.screen, WOOD_MID, right_rect)
         pygame.draw.rect(self.screen, BRONZE_DARK, right_rect, 4)
         pygame.draw.rect(self.screen, BRONZE_LIGHT, right_rect.inflate(-6, -6), 1)
-
-        # Three carved shelves for deck / graveyard / extra
+        # Shared geometry
         slot_w = right_rect.width - 48
-        slot_h = 90
-        top_y = right_rect.y + 40
-        gap = 40
-        for i in range(3):
-            slot = pygame.Rect(right_rect.x + 24, top_y + i * (slot_h + gap), slot_w, slot_h)
-            if slot.bottom + 24 > right_rect.bottom:
-                break
-            pygame.draw.rect(self.screen, WOOD_DARK, slot)
-            shelf_inner = slot.inflate(-8, -8)
-            pygame.draw.rect(self.screen, BRONZE_MID, slot, 3)
-            pygame.draw.rect(self.screen, BRONZE_LIGHT, shelf_inner, 1)
+        slot_h = 110
+        mouse_pos = pygame.mouse.get_pos()
 
-            # Simple stacked card silhouettes to hint deck / graveyard
-            pile_color = (60, 50, 40)
-            for offset in range(3):
-                card_rect = pygame.Rect(
-                    shelf_inner.x + 10 + offset * 6,
-                    shelf_inner.y + 8 + offset * 4,
-                    44,
-                    64,
-                )
-                pygame.draw.rect(self.screen, pile_color, card_rect, border_radius=4)  # type: ignore[arg-type]
+        def draw_deck_and_grave_for(player_id: str, top_side: bool) -> None:
+            """Draw a deck + graveyard pair for the given player.
+
+            top_side=True → P2 (top of board), False → P1 (bottom).
+            """
+            # Vertical anchor: tuck near that player's rows
+            if top_side:
+                base_y = right_rect.y + 28
+            else:
+                # Anchor P1 stacks even higher so they clear the hand tray.
+                base_y = right_rect.bottom - (slot_h * 2 + 190)
+
+            # Deck slot (closer to the board edge), then graveyard beneath
+            deck_slot = pygame.Rect(right_rect.x + 24, base_y, slot_w, slot_h)
+            pygame.draw.rect(self.screen, WOOD_DARK, deck_slot)
+            deck_inner = deck_slot.inflate(-8, -8)
+            pygame.draw.rect(self.screen, BRONZE_MID, deck_slot, 3)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, deck_inner, 1)
+
+            # For P1, also expose hover rect / state so we can animate draws
+            if not top_side:
+                self.deck_pile_rect = deck_inner.copy()
+                self.deck_hover = self.deck_pile_rect.collidepoint(mouse_pos)
+
+            # Deck stack
+            player = next(p for p in self.match.players if p.id == player_id)
+            remaining = len(getattr(player, "deck", []) or [])
+            stack_layers = min(5, max(1, remaining // 3 + 1)) if remaining > 0 else 1
+
+            base_w = 56
+            base_h = 84
+            center_x = deck_inner.centerx
+            base_y = deck_inner.y + 10
+
+            for i in range(stack_layers):
+                offset_x = -8 + i * 4
+                offset_y = i * 4
+                rect = pygame.Rect(0, 0, base_w, base_h)
+                rect.centerx = center_x + offset_x
+                rect.y = base_y + offset_y
+
+                back_surf = self._render_card_back_surface((rect.width, rect.height))
+                # Hover glow only for the active human player's deck
+                if not top_side and self.deck_hover:
+                    glow = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+                    glow.fill(TURN_GLOW + (45,))  # type: ignore[operator]
+                    back_surf.blit(glow, (0, 0))
+                self.screen.blit(back_surf, rect.topleft)
+
+            # Deck counter badge
+            badge_r = 16
+            badge_center = (deck_inner.right - badge_r - 4, deck_inner.top + badge_r + 2)
+            med = pygame.Surface((badge_r * 2, badge_r * 2), pygame.SRCALPHA)
+            center = (badge_r, badge_r)
+            pygame.draw.circle(med, (155, 120, 70, 255), center, badge_r)
+            pygame.draw.circle(med, (210, 180, 110, 255), center, badge_r - 3)
+            pygame.draw.circle(med, (70, 50, 30, 255), center, badge_r, 2)
+            num_txt = self.font_small.render(str(remaining), True, (20, 10, 0))
+            med.blit(num_txt, (center[0] - num_txt.get_width() // 2, center[1] - num_txt.get_height() // 2))
+            self.screen.blit(med, (badge_center[0] - badge_r, badge_center[1] - badge_r))
+
+            # Graveyard slot just below deck
+            grave_y = deck_slot.bottom + 12
+            grave_slot = pygame.Rect(right_rect.x + 24, grave_y, slot_w, slot_h)
+            pygame.draw.rect(self.screen, WOOD_DARK, grave_slot)
+            grave_inner = grave_slot.inflate(-8, -8)
+            pygame.draw.rect(self.screen, BRONZE_MID, grave_slot, 3)
+            pygame.draw.rect(self.screen, BRONZE_LIGHT, grave_inner, 1)
+
+            # For P1, track hover / rect for tooltip + animation target
+            if not top_side:
+                self.grave_pile_rect = grave_inner.copy()
+                self.grave_hover = self.grave_pile_rect.collidepoint(mouse_pos)
+
+            board = self.match.board
+            grave_cards = getattr(board, "graveyards", {}).get(player_id, [])
+            grave_count = len(grave_cards)
+
+            grave_layers = min(6, max(1, grave_count // 2 + 1)) if grave_count > 0 else 1
+            g_base_w = 56
+            g_base_h = 84
+            g_center_x = grave_inner.centerx
+            g_base_y = grave_inner.y + 12
+
+            for i in range(grave_layers):
+                offset_x = -10 + (i * 5 if i % 2 == 0 else -i * 3)
+                offset_y = i * 5
+                rect = pygame.Rect(0, 0, g_base_w, g_base_h)
+                rect.centerx = g_center_x + offset_x
+                rect.y = g_base_y + offset_y
+
+                back_surf = self._render_card_back_surface((rect.width, rect.height), muted=True)
+                if not top_side and self.grave_hover:
+                    glow = pygame.Surface((rect.width, rect.height), pygame.SRCALPHA)
+                    glow.fill((220, 210, 160, 35))
+                    back_surf.blit(glow, (0, 0))
+                self.screen.blit(back_surf, rect.topleft)
+
+            # Graveyard counter
+            g_badge_r = 16
+            g_badge_center = (grave_inner.right - g_badge_r - 4, grave_inner.top + g_badge_r + 2)
+            g_med = pygame.Surface((g_badge_r * 2, g_badge_r * 2), pygame.SRCALPHA)
+            g_center = (g_badge_r, g_badge_r)
+            pygame.draw.circle(g_med, (115, 95, 70, 255), g_center, g_badge_r)
+            pygame.draw.circle(g_med, (170, 145, 105, 255), g_center, g_badge_r - 3)
+            pygame.draw.circle(g_med, (40, 30, 20, 255), g_center, g_badge_r, 2)
+            g_num = self.font_small.render(str(grave_count), True, (15, 8, 0))
+            g_med.blit(g_num, (g_center[0] - g_num.get_width() // 2, g_center[1] - g_num.get_height() // 2))
+            self.screen.blit(g_med, (g_badge_center[0] - g_badge_r, g_badge_center[1] - g_badge_r))
+
+            # Simple hover label only for the local player's graveyard
+            if not top_side and self.grave_hover:
+                tip = self.font_small.render("Graveyard", True, (235, 230, 220))
+                tx = grave_inner.x + (grave_inner.width - tip.get_width()) // 2
+                ty = grave_inner.bottom + 4
+                self.screen.blit(tip, (tx, ty))
+
+        # P2 (opponent) at top, P1 at bottom
+        opp_id = self.match.board.get_opponent("P1")
+        draw_deck_and_grave_for(opp_id, top_side=True)
+        draw_deck_and_grave_for("P1", top_side=False)
 
     def _draw_leaders_and_scores(self, board_rect: pygame.Rect) -> None:
         # Opponent and player summaries anchored inside the left side panel,
@@ -363,30 +524,25 @@ class VisualUI:
         opp = self.match.board.get_opponent("P1")
         p1 = "P1"
 
-        # Mirror _draw_side_panels left layout for leader plaques
+        # Mirror _draw_side_panels left layout for leader plaques and reuse
+        # the same frame geometry so P2 and P1 are identical.
         left_panel_x = 20
         left_panel_y = 20
         left_panel_w = board_rect.x - 40
+        screen_h = self.screen.get_height()
 
-        # Use the same vertical padding from the left background panel
-        # so P2 is offset from the top and P1 is offset equally from the bottom.
-        left_rect_top = left_panel_y
-        left_rect_bottom = self.screen.get_height() - 200  # matches left_rect height in _draw_side_panels
-        vertical_padding = 30
-        plaque_height = 80
-        plaque_width = left_panel_w - 60
+        # Rebuild the same outer frames used in _draw_side_panels with
+        # identical insets (26px from top/bottom of the carved column).
+        frame_h = 130
+        opp_frame = pygame.Rect(left_panel_x + 24, left_panel_y + 26, left_panel_w - 48, frame_h)
+        p1_frame_top = screen_h - 220 - frame_h - 26
+        p1_frame = pygame.Rect(left_panel_x + 24, p1_frame_top, left_panel_w - 48, frame_h)
 
-        # Top leader panel (P2)
-        opp_leader_x = left_panel_x + 30
-        opp_leader_y = left_rect_top + vertical_padding
-        opp_leader_rect = pygame.Rect(opp_leader_x, opp_leader_y, plaque_width, plaque_height)
-
-        # Bottom leader panel (P1) – same padding from bottom as P2 from top
-        p1_x = left_panel_x + 30
-        p1_y = left_rect_bottom - vertical_padding - plaque_height
-        p1_width = plaque_width
-        p1_height = plaque_height
-        p1_leader_rect = pygame.Rect(p1_x, p1_y, p1_width, p1_height)
+        # Inner banner rects inset from the frames; keep alignment identical
+        inset = 8
+        # Both plaques have identical insets so they sit flush
+        opp_leader_rect = opp_frame.inflate(-inset * 2, -inset * 2)
+        p1_leader_rect = p1_frame.inflate(-inset * 2, -inset * 2)
 
         def draw_leader_block(player_id: str, rect: pygame.Rect) -> None:
             # Carved leader plaque with leader card, faction stripe and score medallions
@@ -398,7 +554,7 @@ class VisualUI:
 
             # Left: miniature leader card portrait inside the plaque
             leader_card = getattr(player, "leader", None)
-            card_area_width = rect.width // 3
+            card_area_width = rect.width // 4
             card_margin = 6
             card_rect = pygame.Rect(
                 rect.x + card_margin,
@@ -427,7 +583,7 @@ class VisualUI:
             stripe = pygame.Rect(info_rect.x, info_rect.y, info_rect.width, 12)
             pygame.draw.rect(self.screen, faction_color, stripe)
 
-            # Score / rounds stacked inside the right info block
+            # Score / rounds and labels inside the right info block
             score_rect = pygame.Rect(
                 info_rect.x + 4,
                 stripe.bottom + 4,
@@ -443,9 +599,9 @@ class VisualUI:
             lives = getattr(self.match, "lives", {}).get(player_id, 0)
             wins = getattr(self.match, "wins", {}).get(player_id, 0)
 
-            # Score medallion
-            med_r = 18
-            med_center = (score_rect.x + med_r + 4, score_rect.y + score_rect.height // 2)
+            # Score medallion – emphasize total on the far right like the reference
+            med_r = 20
+            med_center = (score_rect.right - med_r - 6, score_rect.y + score_rect.height // 2)
             med = pygame.Surface((med_r * 2, med_r * 2), pygame.SRCALPHA)  # type: ignore[attr-defined]
             center = (med_r, med_r)
             pygame.draw.circle(med, BRONZE_MID + (255,), center, med_r)
@@ -458,9 +614,9 @@ class VisualUI:
             )
             self.screen.blit(med, (med_center[0] - med_r, med_center[1] - med_r))
 
-            # Round wins, lives and hand size as badges
-            label_x = med_center[0] + med_r + 12
-            label_y = score_rect.y + 4
+            # Round wins, lives and hand size as badges inside the box
+            label_x = score_rect.x + 8
+            label_y = score_rect.y + 6
             # Player id label
             label = self.font_small.render(player_id, True, (235, 225, 205))
             self.screen.blit(label, (label_x, label_y))
@@ -471,7 +627,7 @@ class VisualUI:
             self.screen.blit(hand_text, (label_x, label_y + label.get_height() + 2))
 
             # Wins (rounds) – small gold shields
-            shield_y = label_y + label.get_height() + hand_text.get_height() + 8
+            shield_y = label_y + label.get_height() + hand_text.get_height() + 6
             for i in range(wins):
                 sx = label_x + i * 20
                 shield = pygame.Rect(sx, shield_y, 14, 16)
@@ -485,23 +641,22 @@ class VisualUI:
                 pygame.draw.circle(self.screen, (120, 210, 210), (gx, gem_y), 6)
                 pygame.draw.circle(self.screen, (20, 40, 40), (gx, gem_y), 6, 1)
 
-            # Visual cue when a player has passed this round
+            # Visual cue when a player has passed this round – kept inside rect
             if getattr(player, "passed", False):
-                # Slightly larger than normal small font, in solid black
-                passed_font = self.font_medium
-                passed_text = passed_font.render("PASSED", True, (0, 0, 0))
-                px = rect.right + 8
-                py = rect.y + (rect.height - passed_text.get_height()) // 2
+                passed_text = self.font_small.render("PASSED", True, (0, 0, 0))
+                px = score_rect.right - passed_text.get_width() - 4
+                py = score_rect.y + 4
                 self.screen.blit(passed_text, (px, py))
 
         draw_leader_block(opp, opp_leader_rect)
         draw_leader_block(p1, p1_leader_rect)
 
     def _draw_status_bar(self, active_id: str, board_rect: pygame.Rect) -> None:
-        """Deprecated text bar removed; kept only for PASS button placement.
+        """PASS button plus a small turn/AI status indicator.
 
-        The PASS button is now anchored to the bottom-right of the playfield,
-        similar to Witcher 3.
+        The PASS button is anchored to the bottom-right of the playfield,
+        similar to Witcher 3, and we show whose turn it is so it's clear when
+        the AI is thinking or playing.
         """
         btn_w, btn_h = 110, 32
         # Position comfortably inside the lower-right of the board,
@@ -514,6 +669,22 @@ class VisualUI:
         pygame.draw.rect(self.screen, BRONZE_LIGHT, self.pass_rect, 1)
         ptxt = self.font_medium.render("PASS", True, (255, 255, 255))
         self.screen.blit(ptxt, (self.pass_rect.x + (btn_w - ptxt.get_width()) // 2, self.pass_rect.y + 4))
+
+        # Turn / AI status text just above the button
+        rnd = self.match.current_round
+        status = ""
+        if rnd:
+            if rnd.active_player.id == "P1":
+                status = "Your turn"
+            elif self.ai and rnd.active_player.id == self.ai_player_id:
+                status = "Opponent thinking..."
+            else:
+                status = f"{rnd.active_player.id} turn"
+        if status:
+            st_surf = self.font_small.render(status, True, (240, 235, 220))
+            sx = self.pass_rect.right - st_surf.get_width()
+            sy = self.pass_rect.y - st_surf.get_height() - 4
+            self.screen.blit(st_surf, (sx, sy))
 
     def _draw_hand(self, player_id: str) -> None:
         player = next(p for p in self.match.players if p.id == player_id)
@@ -778,6 +949,49 @@ class VisualUI:
 
         return surf
 
+    def _render_card_back_surface(self, size: Tuple[int, int], *, muted: bool = False) -> pygame.Surface:
+        """Render a generic card back reusing the front-frame style.
+
+        This mirrors the hand card aesthetic but without text, so the deck
+        pile looks like real Gwent cards from Witcher 3.
+        """
+        w, h = size
+        surf = pygame.Surface((w, h), pygame.SRCALPHA)  # type: ignore[attr-defined]
+
+        rect = pygame.Rect(0, 0, w, h)
+        if muted:
+            frame_col = (38, 32, 26)
+            inner_top = (70, 62, 50)
+            inner_bot = (46, 40, 32)
+        else:
+            frame_col = (52, 40, 26)
+            inner_top = (92, 70, 46)
+            inner_bot = (60, 45, 30)
+
+        pygame.draw.rect(surf, frame_col, rect, border_radius=10)  # type: ignore[arg-type]
+        inner_rect = rect.inflate(-6, -6)
+
+        for i in range(inner_rect.height):
+            t = i / max(1, inner_rect.height - 1)
+            r = int(inner_top[0] + (inner_bot[0] - inner_top[0]) * t)
+            g = int(inner_top[1] + (inner_bot[1] - inner_top[1]) * t)
+            b = int(inner_top[2] + (inner_bot[2] - inner_top[2]) * t)
+            pygame.draw.line(
+                surf,
+                (r, g, b),
+                (inner_rect.x, inner_rect.y + i),
+                (inner_rect.right, inner_rect.y + i),
+            )
+
+        pygame.draw.rect(surf, (150, 130, 90), inner_rect, 1)
+
+        # Simple Gwent-like emblem in the center
+        emblem_rect = inner_rect.inflate(-inner_rect.width // 3, -inner_rect.height // 3)
+        pygame.draw.rect(surf, (40, 28, 16), emblem_rect, border_radius=6)  # type: ignore[arg-type]
+        pygame.draw.rect(surf, (180, 150, 90), emblem_rect, 2, border_radius=6)  # type: ignore[arg-type]
+
+        return surf
+
     def _card_color(self, c: Card) -> Tuple[int, int, int]:
         # Simple faction-based coloring
         f = c.faction.value
@@ -911,25 +1125,30 @@ class VisualUI:
                     else:
                         self.ai_wait_timer -= 1
                         if self.ai_wait_timer <= 0:
-                            action = self.ai.choose_action(self.match)
-                            player = rnd.active_player
-                            if action.kind == "pass":
-                                self.match.pass_turn(player)
-                            elif action.kind == "play" and action.card is not None:
-                                # Guard AI play so engine errors don't close the UI
-                                try:
-                                    self.match.play_card(
-                                        player,
-                                        action.card,
-                                        target_row=action.target_row,
-                                        target_unit=action.target_unit,
-                                    )
-                                except Exception as exc:
-                                    # For now just print; could render a small status message instead
-                                    print(f"[AI ERROR] {type(exc).__name__}: {exc}")
-                            # After an AI move, immediately prepare the next delay so it
-                            # will keep going on its subsequent turns.
-                            self.ai_wait_timer = 0
+                            # Re-check active player in case round ended or switched unexpectedly
+                            rnd = self.match.current_round
+                            if not rnd or rnd.finished or rnd.active_player.id != self.ai_player_id:
+                                self.ai_wait_timer = 0
+                            else:
+                                action = self.ai.choose_action(self.match)
+                                player = rnd.active_player
+                                if action.kind == "pass":
+                                    self.match.pass_turn(player)
+                                elif action.kind == "play" and action.card is not None:
+                                    # Guard AI play so engine errors don't close the UI
+                                    try:
+                                        self.match.play_card(
+                                            player,
+                                            action.card,
+                                            target_row=action.target_row,
+                                            target_unit=action.target_unit,
+                                        )
+                                    except Exception as exc:
+                                        # For now just print; could render a small status message instead
+                                        print(f"[AI ERROR] {type(exc).__name__}: {exc}")
+                                # After an AI move, immediately prepare the next delay so it
+                                # will keep going on its subsequent turns.
+                                self.ai_wait_timer = 0
 
             if self.match.match_winner():
                 # Simple end condition: pause briefly then exit
@@ -1090,6 +1309,12 @@ class VisualUI:
         for sprite in getattr(self, "hand_sprites", []):
             if sprite.rect.collidepoint(pos):
                 self.info_card = sprite.card
+                return
+
+        # Right-click on a card already on the board to open description
+        for card, rect in self.board_card_rects:
+            if rect.collidepoint(pos):
+                self.info_card = card
                 return
 
 

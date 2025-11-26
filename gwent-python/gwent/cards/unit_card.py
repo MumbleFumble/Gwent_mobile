@@ -58,5 +58,5 @@ class UnitCard(Card):
             hero=(card.get("Hero") == "Yes"),
             abilities=abilities,
             tags=[],
-            meta=meta,
+            meta=meta,  
         )
